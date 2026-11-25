@@ -1,0 +1,48 @@
+# Lyfta MCP
+
+A local stdio MCP server for the [official Lyfta Developer API](https://my.lyfta.app/community/api). It works with the personal Lyfta library attached to the configured API key.
+
+## Setup
+
+1. Install Rust and Cargo 1.88 or newer and run `cargo build --locked` in this directory.
+2. To access your account, sign in to [Lyfta API Access](https://my.lyfta.app/community/api) and generate a personal API key. Save it in an `.env` file in this directory as `LYFTA_API_KEY=your_key_here` or inject it into the MCP server's environment. Git ignores the `.env` file.
+3. Configure your MCP client to launch the server over stdio. Replace `/absolute/path/to/lyfta` with this directory. Use `target/debug/lyfta-mcp.exe` on Windows.
+
+```json
+{
+  "mcpServers": {
+    "lyfta": {
+      "command": "/absolute/path/to/lyfta/target/debug/lyfta-mcp",
+      "args": [
+        "--env-file",
+        "/absolute/path/to/lyfta/.env"
+      ]
+    }
+  }
+}
+```
+
+Call `lyfta_sample_workouts` to try the public sample endpoint without a key. Use `lyfta_list_workouts` with `limit: 1` to verify account access. From this directory you can also launch the server with `cargo run --locked`. The server looks for `.env` in the current directory when `--env-file` is omitted. A `LYFTA_API_KEY` supplied directly in the environment takes precedence.
+
+## Tools
+
+| Tool | Use |
+| --- | --- |
+| `lyfta_list_workouts` | Read completed sessions with exercises, sets, reps, and weights. Supports pagination and inclusive UTC date filters. |
+| `lyfta_list_workout_summaries` | Browse a lighter history with duration and volume. |
+| `lyfta_list_performed_exercises`, `lyfta_search_exercise_library` | Find exercises you logged or search the full catalog. |
+| `lyfta_get_exercise_progress` | Look up best sets and estimated one-rep max for an exercise. |
+| `lyfta_list_schedule` | See scheduled sessions, optionally including completed sessions. |
+| `lyfta_list_collections`, `lyfta_get_collection` | Browse saved programs and their routines. |
+| `lyfta_list_templates`, `lyfta_get_template` | Browse saved routines and read their exercises and sets. |
+| `lyfta_create_collection` | Create a program with a title, optional description, goal, and cover. |
+| `lyfta_create_template` | Add a new routine to a specific program, including exercise order, sets, rep ranges, loads, rest, and supersets. |
+| `lyfta_sample_workouts` | Check the connection against Lyfta's public example data. |
+
+## Saving revised plans
+
+The [public API specification](https://my.lyfta.app/openapi.json) documents creation of collections and templates. Editing an existing collection or template in place, deleting it, and changing the calendar are outside those endpoints.
+
+To save a revision, read the original routine with `lyfta_get_template`, then use `lyfta_create_template` to save a named revision in its collection or a new collection. Use the exact exercise ID, name, type, and image from Lyfta's exercise tools. A template requires an existing `collectionId` and Lyfta's request format stores set values such as reps and weight as strings.
+
+Each create call sends one POST and returns the new item's ID. Lyfta does not document an idempotency key for these endpoints. After an interrupted or ambiguous write, inspect the program or list your collections before submitting the create again.
