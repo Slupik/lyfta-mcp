@@ -36,6 +36,7 @@ Build a static Linux binary on macOS with `cargo zigbuild --release --locked --t
 | --- | --- |
 | `lyfta_list_workouts` | Read completed sessions with exercises, sets, reps, and weights. Supports pagination and inclusive UTC date filters. |
 | `lyfta_list_workout_summaries` | Browse a lighter history with duration and volume. |
+| `lyfta_get_training_summary` | Count sessions, see weekly volume by weight unit, and count completed sets by body part for a date range. |
 | `lyfta_list_performed_exercises`, `lyfta_search_exercise_library` | Find exercises you logged or search the full catalog. |
 | `lyfta_get_exercise_progress` | Look up best sets and estimated one-rep max for an exercise. |
 | `lyfta_list_schedule` | See scheduled sessions, optionally including completed sessions. |
@@ -44,6 +45,10 @@ Build a static Linux binary on macOS with `cargo zigbuild --release --locked --t
 | `lyfta_create_collection` | Create a program with a title, optional description, goal, and cover. |
 | `lyfta_create_template` | Add a new routine to a specific program, including exercise order, sets, rep ranges, loads, rest, and supersets. |
 | `lyfta_sample_workouts` | Check the connection against Lyfta's public example data. |
+
+## Summarizing training
+
+Call `lyfta_get_training_summary` with inclusive UTC dates `from` and `to` in YYYY-MM-DD format. It reads all matching workout pages and groups Lyfta's recorded volume by Monday-start week and weight unit. Each completed set counts once for every body part Lyfta tags on its exercise. Sets with logged reps, duration, or distance count when the completion flag is missing or the session has no completed flags. The report shows how many sets were inferred this way. The report includes counts for sessions with missing dates, weeks with missing volume values, and sets without a body part.
 
 ## Saving revised plans
 

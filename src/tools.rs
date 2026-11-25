@@ -12,6 +12,7 @@ use rmcp::{
     service::RequestContext,
 };
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::lyfta::{LyftaClient, Request};
 
@@ -22,6 +23,7 @@ enum Method {
     List,
     GetById,
     Create,
+    TrainingSummary,
 }
 
 struct Route {
@@ -63,7 +65,7 @@ impl Route {
         })
     }
 
-    fn prepare(&self, mut args: Value) -> Result<(String, Request), String> {
+    fn validate(&self, mut args: Value) -> Result<Map<String, Value>, String> {
         for pointer in ["/search", "/collection/title"] {
             if let Some(value) = args.pointer_mut(pointer)
                 && let Some(text) = value.as_str()
@@ -92,6 +94,15 @@ impl Route {
             }
         }
 
+        Ok(args)
+    }
+
+    async fn run(
+        &self,
+        client: &LyftaClient,
+        mut args: Map<String, Value>,
+        cancellation: CancellationToken,
+    ) -> Result<Value, String> {
         let mut path = self.path.to_owned();
         let request = match self.method {
             Method::Sample => Request::Sample,
@@ -108,8 +119,17 @@ impl Route {
                     .collect();
                 Request::Read(query)
             }
+            Method::TrainingSummary => {
+                return crate::summary::training_summary(
+                    client,
+                    args["from"].as_str().expect("validated start date"),
+                    args["to"].as_str().expect("validated end date"),
+                    cancellation,
+                )
+                .await;
+            }
         };
-        Ok((path, request))
+        client.request(&path, request, cancellation).await
     }
 }
 
@@ -155,6 +175,13 @@ impl LyftaServer {
                 List,
                 "/api/v1/workouts/summary",
                 object(Value::Object(pagination(1000, 20)), &[]),
+            )?,
+            Route::new(
+                "get_training_summary",
+                "Summarize completed training for an inclusive UTC date range. Returns session counts, weekly lifted volume by unit, and completed sets by body part.",
+                Method::TrainingSummary,
+                "",
+                object(with_dates(Map::new()), &["from", "to"]),
             )?,
             Route::new(
                 "list_performed_exercises",
@@ -288,8 +315,8 @@ impl ServerHandler for LyftaServer {
             .ok_or_else(|| {
                 ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "Unknown Lyfta tool.", None)
             })?;
-        let result = match route.prepare(Value::Object(request.arguments.unwrap_or_default())) {
-            Ok((path, request)) => self.client.request(&path, request, context.ct).await,
+        let result = match route.validate(Value::Object(request.arguments.unwrap_or_default())) {
+            Ok(args) => route.run(&self.client, args, context.ct).await,
             Err(error) => Err(error),
         };
         Ok(match result {

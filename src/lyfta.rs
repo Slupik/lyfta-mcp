@@ -114,6 +114,39 @@ impl LyftaClient {
             outcome = exchange => outcome,
         }
     }
+
+    pub async fn performed_exercises(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Value>, String> {
+        let mut exercises = Vec::new();
+        for page in 1.. {
+            let mut response = self
+                .request(
+                    "/api/v1/exercises",
+                    Request::Read(vec![
+                        ("limit".into(), "100".into()),
+                        ("page".into(), page.to_string()),
+                    ]),
+                    cancellation.clone(),
+                )
+                .await?;
+            let batch = response["exercises"]
+                .as_array_mut()
+                .ok_or("Lyfta returned no performed exercise list.")?;
+            let count = batch.len() as u64;
+            exercises.append(batch);
+            if count == 0
+                || response["total_pages"].as_u64().map_or_else(
+                    || count < response["limit"].as_u64().unwrap_or(100),
+                    |total_pages| page >= total_pages,
+                )
+            {
+                return Ok(exercises);
+            }
+        }
+        unreachable!()
+    }
 }
 
 fn has_created_id(id: &Value) -> bool {
