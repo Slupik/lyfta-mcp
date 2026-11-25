@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use jsonschema::Validator;
@@ -124,9 +124,10 @@ fn query_value(value: &Value) -> String {
     }
 }
 
+#[derive(Clone)]
 pub struct LyftaServer {
     client: LyftaClient,
-    routes: Vec<Route>,
+    routes: Arc<Vec<Route>>,
 }
 
 impl LyftaServer {
@@ -251,7 +252,10 @@ impl LyftaServer {
                 template_schema(),
             )?,
         ];
-        Ok(Self { client, routes })
+        Ok(Self {
+            client,
+            routes: Arc::new(routes),
+        })
     }
 }
 

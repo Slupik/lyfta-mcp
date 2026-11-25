@@ -24,6 +24,12 @@ A local stdio MCP server for the [official Lyfta Developer API](https://my.lyfta
 
 Call `lyfta_sample_workouts` to try the public sample endpoint without a key. Use `lyfta_list_workouts` with `limit: 1` to verify account access. From this directory you can also launch the server with `cargo run --locked`. The server looks for `.env` in the current directory when `--env-file` is omitted. A `LYFTA_API_KEY` supplied directly in the environment takes precedence.
 
+## Remote (HTTP) mode
+
+`lyfta-mcp --env-file PATH --http 127.0.0.1:18202 --allowed-host mcp.example.com` serves stateless streamable HTTP at `/mcp`. The server has no authentication of its own: bind it to loopback and put an authenticating proxy in front (for example Cloudflare Access with Managed OAuth). Requests whose `Host` header is not loopback or an `--allowed-host` value are rejected.
+
+Build a static Linux binary on macOS with `cargo zigbuild --release --locked --target x86_64-unknown-linux-musl`.
+
 ## Tools
 
 | Tool | Use |
