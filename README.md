@@ -43,6 +43,7 @@ Build a static Linux binary on macOS with `cargo zigbuild --release --locked --t
 | `lyfta_list_collections`, `lyfta_get_collection` | Browse saved programs and their routines. |
 | `lyfta_list_templates`, `lyfta_get_template` | Browse saved routines and read their exercises and sets. |
 | `lyfta_create_collection` | Create a program with a title, optional description, goal, and cover. |
+| `lyfta_preview_template` | Match exercise names and review a draft routine before saving. |
 | `lyfta_create_template` | Add a new routine to a specific program, including exercise order, sets, rep ranges, loads, rest, and supersets. |
 | `lyfta_sample_workouts` | Check the connection against Lyfta's public example data. |
 
@@ -55,5 +56,7 @@ Call `lyfta_get_training_summary` with inclusive UTC dates `from` and `to` in YY
 The [public API specification](https://my.lyfta.app/openapi.json) documents creation of collections and templates. Editing an existing collection or template in place, deleting it, and changing the calendar are outside those endpoints.
 
 To save a revision, read the original routine with `lyfta_get_template`, then use `lyfta_create_template` to save a named revision in its collection or a new collection. Use the exact exercise ID, name, type, and image from Lyfta's exercise tools. A template requires an existing `collectionId` and Lyfta's request format stores set values such as reps and weight as strings.
+
+To draft a routine from exercise names, call `lyfta_preview_template` with the destination `collectionId` and a `workout` whose exercises use `name`. Each exercise accepts the same sets, rest time, notes, and superset fields as creation. The preview matches exact names ignoring case and repeated whitespace. For an approximate or ambiguous name, choose a returned candidate by its catalog name and `exercise_id`, then preview again. When all exercises match and have the required catalog metadata, review `create_template_arguments` and pass it to `lyfta_create_template` to save the routine. Previewing only reads from Lyfta.
 
 Each create call sends one POST and returns the new item's ID. Lyfta does not document an idempotency key for these endpoints. After an interrupted or ambiguous write, inspect the program or list your collections before submitting the create again.

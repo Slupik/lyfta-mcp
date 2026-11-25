@@ -1,4 +1,5 @@
 mod lyfta;
+mod preview;
 mod summary;
 mod tools;
 

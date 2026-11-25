@@ -153,3 +153,7 @@ fn has_created_id(id: &Value) -> bool {
     id.as_u64().is_some_and(|number| number > 0)
         || id.as_str().is_some_and(|text| !text.trim().is_empty())
 }
+
+pub fn numeric_id(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_str()?.parse().ok())
+}

@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::lyfta::{LyftaClient, Request};
 
-const MAX_SAFE_INT: u64 = 9_007_199_254_740_991;
+pub const MAX_SAFE_INT: u64 = 9_007_199_254_740_991;
 
 enum Method {
     Sample,
@@ -24,6 +24,7 @@ enum Method {
     GetById,
     Create,
     TrainingSummary,
+    PreviewTemplate,
 }
 
 struct Route {
@@ -127,6 +128,9 @@ impl Route {
                     cancellation,
                 )
                 .await;
+            }
+            Method::PreviewTemplate => {
+                return crate::preview::preview_template(client, args, cancellation).await;
             }
         };
         client.request(&path, request, cancellation).await
@@ -272,11 +276,18 @@ impl LyftaServer {
                 collection_schema(),
             )?,
             Route::new(
+                "preview_template",
+                "Preview a routine using catalog exercise names. Review exact matches or choose from suggested exercises. When ready, use create_template_arguments with lyfta_create_template after user approval.",
+                Method::PreviewTemplate,
+                "",
+                template_schema(true),
+            )?,
+            Route::new(
                 "create_template",
                 "Create a new workout template and append it to the specified collection. For a revised routine, use a new title or collection. Each successful call adds a template.",
                 Create,
                 "/api/v1/templates",
-                template_schema(),
+                template_schema(false),
             )?,
         ];
         Ok(Self {
@@ -380,7 +391,7 @@ fn collection_schema() -> Value {
     object(json!({"collection": collection}), &["collection"])
 }
 
-fn template_schema() -> Value {
+fn template_schema(preview: bool) -> Value {
     let set = object(
         json!({
             "set_type_id": {"type": "integer", "minimum": 0, "maximum": MAX_SAFE_INT, "description": "0 for a normal set"},
@@ -394,36 +405,47 @@ fn template_schema() -> Value {
         }),
         &[],
     );
-    let exercise = object(
-        json!({
-            "exercise_id": {"type": "integer", "minimum": 1, "maximum": MAX_SAFE_INT, "description": "Catalog id, as an integer"},
-            "excercise_name": {"type": "string", "minLength": 1, "description": "Exact catalog name. Spelling of the field is required by Lyfta."},
-            "exercise_type": {"type": "string", "description": "Exact catalog exercise_type"},
-            "exercise_image": {"type": "string", "description": "Exact catalog image_name"},
-            "exercise_note": {"type": "string"},
-            "exercise_rest_time": {"type": "integer", "minimum": 0, "maximum": MAX_SAFE_INT, "description": "Rest time in seconds"},
-            "exercise_superset_id": {"type": "integer", "minimum": 0, "maximum": MAX_SAFE_INT, "description": "Use the same positive ID for exercises in one superset"},
-            "is_rep_range_active": {"type": "boolean"},
-            "sets": {"type": "array", "items": set}
-        }),
-        &[
-            "exercise_id",
-            "excercise_name",
-            "exercise_type",
-            "exercise_image",
-        ],
-    );
-    let workout = object(
-        json!({
-            "title": {"type": "string"},
-            "description": {"type": "string"},
-            "note": {"type": "string"},
-            "color": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"},
-            "picture": {"type": "string", "description": "Cover image as a base64 image data URI or existing Lyfta CDN URL"},
-            "exercises": {"type": "array", "items": exercise, "description": "Exercise order is preserved. Copy the ID, name, type, and image from Lyfta."}
-        }),
-        &[],
-    );
+    let mut exercise_properties = json!({
+        "exercise_id": {"type": "integer", "minimum": 1, "maximum": MAX_SAFE_INT, "description": "Catalog ID. In a preview, include it to select among matches."},
+        "exercise_note": {"type": "string"},
+        "exercise_rest_time": {"type": "integer", "minimum": 0, "maximum": MAX_SAFE_INT, "description": "Rest time in seconds"},
+        "exercise_superset_id": {"type": "integer", "minimum": 0, "maximum": MAX_SAFE_INT, "description": "Use the same positive ID for exercises in one superset"},
+        "is_rep_range_active": {"type": "boolean"},
+        "sets": {"type": "array", "items": set}
+    });
+    let exercise = if preview {
+        exercise_properties["name"] = json!({"type": "string", "pattern": "\\S", "description": "Exercise name as it appears in Lyfta, or a search term to find candidates"});
+        object(exercise_properties, &["name"])
+    } else {
+        exercise_properties["excercise_name"] = json!({"type": "string", "minLength": 1, "description": "Exact catalog name. Spelling of the field is required by Lyfta."});
+        exercise_properties["exercise_type"] =
+            json!({"type": "string", "description": "Exact catalog exercise_type"});
+        exercise_properties["exercise_image"] =
+            json!({"type": "string", "description": "Exact catalog image_name"});
+        object(
+            exercise_properties,
+            &[
+                "exercise_id",
+                "excercise_name",
+                "exercise_type",
+                "exercise_image",
+            ],
+        )
+    };
+    let mut workout_properties = json!({
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "note": {"type": "string"},
+        "color": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"},
+        "picture": {"type": "string", "description": "Cover image as a base64 image data URI or existing Lyfta CDN URL"},
+        "exercises": {"type": "array", "items": exercise, "description": "Exercise order is preserved."}
+    });
+    let workout = if preview {
+        workout_properties["exercises"]["minItems"] = json!(1);
+        object(workout_properties, &["exercises"])
+    } else {
+        object(workout_properties, &[])
+    };
     object(
         json!({
             "collectionId": {"type": "integer", "minimum": 1, "maximum": MAX_SAFE_INT, "description": "ID of an existing collection in your library"},

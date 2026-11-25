@@ -4,7 +4,7 @@ use chrono::NaiveDate;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::lyfta::{LyftaClient, Request};
+use crate::lyfta::{LyftaClient, Request, numeric_id};
 
 const BODY_PARTS: [&str; 20] = [
     "Thighs",
@@ -216,10 +216,6 @@ fn has_logged_values(set: &Value) -> bool {
                     && parts.any(|part| part.parse::<u64>().is_ok_and(|part| part > 0))
             })
     })
-}
-
-fn numeric_id(value: &Value) -> Option<u64> {
-    value.as_u64().or_else(|| value.as_str()?.parse().ok())
 }
 
 fn catalog_body_parts(value: &Value) -> BTreeSet<String> {
