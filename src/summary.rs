@@ -4,30 +4,10 @@ use chrono::NaiveDate;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::lyfta::{LyftaClient, Request, numeric_id};
-
-const BODY_PARTS: [&str; 20] = [
-    "Thighs",
-    "Chest",
-    "Hips",
-    "Back",
-    "Upper Arms",
-    "Shoulders",
-    "Forearms",
-    "Calves",
-    "Neck",
-    "Cardio",
-    "Full body",
-    "Waist",
-    "Plyometrics",
-    "Weightlifting",
-    "Yoga",
-    "Stretching",
-    "Biceps",
-    "Triceps",
-    "Quadriceps",
-    "Hamstrings",
-];
+use crate::{
+    exercise_metadata::{BodyPart, body_parts as decode_body_parts},
+    lyfta::{LyftaClient, Request, numeric_id},
+};
 
 pub async fn training_summary(
     client: &LyftaClient,
@@ -219,24 +199,7 @@ fn has_logged_values(set: &Value) -> bool {
 }
 
 fn catalog_body_parts(value: &Value) -> BTreeSet<String> {
-    let decoded = value
-        .as_str()
-        .and_then(|text| serde_json::from_str(text).ok());
-    decoded
-        .as_ref()
-        .unwrap_or(value)
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(numeric_id)
-        .map(|id| {
-            if (1..=BODY_PARTS.len() as u64).contains(&id) {
-                BODY_PARTS[id as usize - 1].to_owned()
-            } else {
-                format!("Lyfta body part #{id}")
-            }
-        })
-        .collect()
+    decode_body_parts(value).map(BodyPart::label).collect()
 }
 
 #[cfg(test)]

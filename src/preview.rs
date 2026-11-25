@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    exercise_metadata,
     lyfta::{LyftaClient, Request, numeric_id},
     tools::MAX_SAFE_INT,
 };
@@ -14,71 +15,107 @@ pub async fn preview_template(
     cancellation: CancellationToken,
 ) -> Result<Value, String> {
     let mut draft = Value::Object(args);
-    let exercises = draft["workout"]["exercises"]
-        .as_array_mut()
-        .expect("validated preview exercises");
-    let mut matches = Vec::with_capacity(exercises.len());
-    let mut performed = None;
-    let mut ready = true;
-
-    for (index, exercise) in exercises.iter_mut().enumerate() {
-        let name = exercise["name"].as_str().expect("validated exercise name");
-        let search = name.split_whitespace().collect::<Vec<_>>().join(" ");
-        let exact_name = search.to_lowercase();
-        let selected_id = exercise["exercise_id"].as_u64();
-        let found = search_catalog(client, &search, &cancellation).await?;
-        let matched = match select_exercise(&found, &exact_name, selected_id) {
-            Ok(candidate) => candidate,
-            Err(status) => {
-                ready = false;
-                let candidates: Vec<Value> = found
-                    .iter()
-                    .filter(|item| status != "ambiguous" || exact_match(item, &exact_name))
-                    .take(5)
-                    .map(candidate_label)
-                    .collect();
-                matches.push(json!({
-                    "index": index, "requested_name": name, "status": status,
-                    "candidates": candidates,
-                }));
-                continue;
-            }
-        };
-        let mut fields = template_fields(matched);
-        if fields.is_none() {
-            if performed.is_none() {
-                performed = Some(client.performed_exercises(&cancellation).await?);
-            }
-            let id = numeric_id(&matched["id"]);
-            fields = performed
-                .as_ref()
-                .expect("loaded performed exercises")
-                .iter()
-                .find(|item| numeric_id(&item["id"]) == id)
-                .and_then(template_fields);
-        }
-        let Some(fields) = fields else {
-            ready = false;
-            matches.push(json!({
-                "index": index, "requested_name": name, "status": "missing_catalog_metadata",
-                "candidates": [candidate_label(matched)],
-            }));
-            continue;
-        };
-        matches.push(json!({
-            "index": index, "requested_name": name, "status": "matched",
-            "exercise_id": fields["exercise_id"], "name": fields["excercise_name"],
-        }));
-        let exercise = exercise.as_object_mut().expect("validated exercise object");
-        exercise.remove("name");
-        exercise.extend(fields);
-    }
-
+    let mut catalog = Catalog::default();
+    let (ready, matches) = catalog
+        .match_workout(client, &mut draft["workout"], &cancellation)
+        .await?;
     let mut result = json!({"ready": ready, "exercise_matches": matches});
     if ready {
         result["create_template_arguments"] = draft;
     }
     Ok(result)
+}
+
+#[derive(Default)]
+pub struct Catalog {
+    searches: HashMap<String, Vec<Value>>,
+    performed: Option<Vec<Value>>,
+}
+
+impl Catalog {
+    pub async fn match_workout(
+        &mut self,
+        client: &LyftaClient,
+        workout: &mut Value,
+        cancellation: &CancellationToken,
+    ) -> Result<(bool, Vec<Value>), String> {
+        let exercises = workout["exercises"]
+            .as_array_mut()
+            .expect("validated preview exercises");
+        let mut matches = Vec::with_capacity(exercises.len());
+        let mut ready = true;
+
+        for (index, exercise) in exercises.iter_mut().enumerate() {
+            let name = exercise["name"].as_str().expect("validated exercise name");
+            let search = name.split_whitespace().collect::<Vec<_>>().join(" ");
+            let exact_name = search.to_lowercase();
+            let selected_id = exercise["exercise_id"].as_u64();
+            if !self.searches.contains_key(&exact_name) {
+                self.searches.insert(
+                    exact_name.clone(),
+                    search_catalog(client, &search, cancellation).await?,
+                );
+            }
+            let found = &self.searches[&exact_name];
+            let matched = match select_exercise(found, &exact_name, selected_id) {
+                Ok(candidate) => candidate,
+                Err(status) => {
+                    ready = false;
+                    let candidates: Vec<Value> = found
+                        .iter()
+                        .filter(|item| status != "ambiguous" || exact_match(item, &exact_name))
+                        .take(5)
+                        .map(candidate_label)
+                        .collect();
+                    matches.push(json!({
+                        "index": index, "requested_name": name, "status": status,
+                        "candidates": candidates,
+                    }));
+                    continue;
+                }
+            };
+            let mut fields = template_fields(matched);
+            let mut fallback = &Value::Null;
+            if fields.is_none() {
+                if self.performed.is_none() {
+                    self.performed = Some(client.performed_exercises(cancellation).await?);
+                }
+                let id = numeric_id(&matched["id"]);
+                if let Some(item) = self
+                    .performed
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find(|item| numeric_id(&item["id"]) == id)
+                {
+                    fields = template_fields(item);
+                    fallback = item;
+                }
+            }
+            let Some(fields) = fields else {
+                ready = false;
+                matches.push(json!({
+                    "index": index, "requested_name": name, "status": "missing_catalog_metadata",
+                    "candidates": [candidate_label(matched)],
+                }));
+                continue;
+            };
+            let mut resolved = exercise_metadata::labels(matched, fallback);
+            resolved.extend(Map::from_iter([
+                ("index".into(), json!(index)),
+                ("requested_name".into(), json!(name)),
+                ("status".into(), json!("matched")),
+                ("exercise_id".into(), fields["exercise_id"].clone()),
+                ("name".into(), fields["excercise_name"].clone()),
+            ]));
+            matches.push(Value::Object(resolved));
+            let exercise = exercise.as_object_mut().expect("validated exercise object");
+            exercise.remove("name");
+            exercise.extend(fields);
+        }
+
+        Ok((ready, matches))
+    }
 }
 
 async fn search_catalog(
@@ -156,7 +193,10 @@ fn exact_match(item: &Value, exact_name: &str) -> bool {
 }
 
 fn candidate_label(item: &Value) -> Value {
-    json!({"exercise_id": numeric_id(&item["id"]), "name": item["name"]})
+    let mut candidate = exercise_metadata::labels(item, &Value::Null);
+    candidate.insert("exercise_id".into(), json!(numeric_id(&item["id"])));
+    candidate.insert("name".into(), item["name"].clone());
+    Value::Object(candidate)
 }
 
 fn template_fields(item: &Value) -> Option<Map<String, Value>> {

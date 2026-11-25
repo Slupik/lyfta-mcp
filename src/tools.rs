@@ -1,4 +1,4 @@
-use std::{error::Error, sync::Arc};
+use std::{error::Error, path::PathBuf, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use jsonschema::Validator;
@@ -14,7 +14,11 @@ use rmcp::{
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::lyfta::{LyftaClient, Request};
+use crate::{
+    exercise_metadata,
+    lyfta::{LyftaClient, Request},
+    program_store::ProgramStore,
+};
 
 pub const MAX_SAFE_INT: u64 = 9_007_199_254_740_991;
 
@@ -25,6 +29,11 @@ enum Method {
     Create,
     TrainingSummary,
     PreviewTemplate,
+    PreviewProgram,
+    LoadProgramDraft,
+    ComparableSets,
+    SaveProgram,
+    ResumeProgramSave,
 }
 
 struct Route {
@@ -50,11 +59,17 @@ impl Route {
         let Value::Object(schema) = schema else {
             return Err("Expected a tool schema object.".into());
         };
+        let writes = matches!(
+            method,
+            Method::Create | Method::SaveProgram | Method::ResumeProgramSave
+        );
         let mut annotations = ToolAnnotations::default()
-            .read_only(!matches!(method, Method::Create))
+            .read_only(!writes)
             .open_world(true);
-        if matches!(method, Method::Create) {
-            annotations = annotations.destructive(false).idempotent(false);
+        if writes {
+            annotations = annotations
+                .destructive(false)
+                .idempotent(!matches!(method, Method::Create));
         }
         let tool =
             Tool::new(format!("lyfta_{name}"), description, schema).with_annotations(annotations);
@@ -101,6 +116,7 @@ impl Route {
     async fn run(
         &self,
         client: &LyftaClient,
+        programs: &ProgramStore,
         mut args: Map<String, Value>,
         cancellation: CancellationToken,
     ) -> Result<Value, String> {
@@ -132,8 +148,41 @@ impl Route {
             Method::PreviewTemplate => {
                 return crate::preview::preview_template(client, args, cancellation).await;
             }
+            Method::PreviewProgram => {
+                return crate::program::preview(client, programs, args, &cancellation).await;
+            }
+            Method::LoadProgramDraft => {
+                return crate::program::load_draft(client, args, &cancellation).await;
+            }
+            Method::ComparableSets => {
+                return crate::history::comparable_sets(client, args, &cancellation).await;
+            }
+            Method::SaveProgram | Method::ResumeProgramSave => {
+                return programs
+                    .save(
+                        client,
+                        args["preview_id"].as_str().unwrap(),
+                        matches!(self.method, Method::SaveProgram),
+                        &cancellation,
+                    )
+                    .await;
+            }
         };
-        client.request(&path, request, cancellation).await
+        let mut result = client.request(&path, request, cancellation).await?;
+        let exercises = match self.path {
+            "/api/v1/exercises" => result.pointer_mut("/exercises"),
+            "/api/v1/exercises/library" => result.pointer_mut("/data/results"),
+            _ => None,
+        };
+        if let Some(exercises) = exercises.and_then(Value::as_array_mut) {
+            for exercise in exercises {
+                let labels = exercise_metadata::labels(exercise, &Value::Null);
+                if let Some(fields) = exercise.as_object_mut() {
+                    fields.extend(labels);
+                }
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -152,10 +201,11 @@ fn query_value(value: &Value) -> String {
 pub struct LyftaServer {
     client: LyftaClient,
     routes: Arc<Vec<Route>>,
+    programs: ProgramStore,
 }
 
 impl LyftaServer {
-    pub fn new(client: LyftaClient) -> Result<Self, Box<dyn Error>> {
+    pub fn new(client: LyftaClient, state_directory: PathBuf) -> Result<Self, Box<dyn Error>> {
         use Method::{Create, GetById, List, Sample};
 
         let routes = vec![
@@ -189,14 +239,14 @@ impl LyftaServer {
             )?,
             Route::new(
                 "list_performed_exercises",
-                "List exercises you have logged and their IDs for looking up progress.",
+                "List exercises you have logged with catalog IDs and Lyfta equipment, body part and muscle labels.",
                 List,
                 "/api/v1/exercises",
                 object(Value::Object(pagination(100, 20)), &[]),
             )?,
             Route::new(
                 "search_exercise_library",
-                "Search Lyfta’s exercise catalog by name.",
+                "Search Lyfta’s exercise catalog by name and see equipment, body part and muscle labels.",
                 List,
                 "/api/v1/exercises/library",
                 object(
@@ -269,6 +319,58 @@ impl LyftaServer {
                 object(json!({"id": id("Template ID")}), &["id"]),
             )?,
             Route::new(
+                "preview_program",
+                "Preview all days in a training program. Choose catalog candidates and resolve estimated weight ranges, then preview again. Present all days and their load sources to the user. Save this preview ID only after the user explicitly approves it.",
+                Method::PreviewProgram,
+                "",
+                program_schema(),
+            )?,
+            Route::new(
+                "load_program_draft",
+                "Read an existing Lyfta collection into an editable draft for lyfta_preview_program. Change exercises, order or set parameters in the returned draft, then preview it and get explicit approval before saving as a new program.",
+                Method::LoadProgramDraft,
+                "",
+                object(
+                    json!({
+                        "collection_id": id("Existing collection ID"),
+                        "title": {"type": "string", "pattern": "\\S", "description": "Title for the new program"}
+                    }),
+                    &["collection_id", "title"],
+                ),
+            )?,
+            Route::new(
+                "get_comparable_sets",
+                "Read recent completed weighted sets for exercises you judge biomechanically comparable to a new target. Choose source IDs from the user's performed exercises. Reference actual source sets in an estimate. If the sets are unsuitable or unavailable, leave the weight blank for a light trial set.",
+                Method::ComparableSets,
+                "",
+                object(
+                    json!({
+                        "target_exercise_id": catalog_id("Catalog ID of the new exercise"),
+                        "comparable_exercise_ids": {
+                            "type":"array", "uniqueItems":true, "maxItems":20,
+                            "items": catalog_id("ID of a comparable performed exercise")
+                        },
+                        "sets_per_exercise": {"type":"integer", "minimum":1, "maximum":20, "default":5},
+                        "from": {"type":"string", "format":"date", "description":"Optional inclusive UTC start date"}
+                    }),
+                    &["target_exercise_id", "comparable_exercise_ids"],
+                ),
+            )?,
+            Route::new(
+                "save_program",
+                "Create the program and routines from an immutable ready preview. Call only after explicit user approval of that exact preview. Returns IDs and a resume tool if interrupted.",
+                Method::SaveProgram,
+                "",
+                save_schema(true),
+            )?,
+            Route::new(
+                "resume_program_save",
+                "Continue a previously approved program save with the same preview ID. Reconcile uncertain writes with the Lyfta library before continuing. Returns the collection ID and previously saved routine IDs.",
+                Method::ResumeProgramSave,
+                "",
+                save_schema(false),
+            )?,
+            Route::new(
                 "create_collection",
                 "Create a new training program in your Lyfta library and return its collection ID. Each successful call adds a collection.",
                 Create,
@@ -293,6 +395,7 @@ impl LyftaServer {
         Ok(Self {
             client,
             routes: Arc::new(routes),
+            programs: ProgramStore::new(state_directory),
         })
     }
 }
@@ -327,7 +430,11 @@ impl ServerHandler for LyftaServer {
                 ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "Unknown Lyfta tool.", None)
             })?;
         let result = match route.validate(Value::Object(request.arguments.unwrap_or_default())) {
-            Ok(args) => route.run(&self.client, args, context.ct).await,
+            Ok(args) => {
+                route
+                    .run(&self.client, &self.programs, args, context.ct)
+                    .await
+            }
             Err(error) => Err(error),
         };
         Ok(match result {
@@ -391,7 +498,7 @@ fn collection_schema() -> Value {
     object(json!({"collection": collection}), &["collection"])
 }
 
-fn template_schema(preview: bool) -> Value {
+pub fn template_schema(preview: bool) -> Value {
     let set = object(
         json!({
             "set_type_id": {"type": "integer", "minimum": 0, "maximum": MAX_SAFE_INT, "description": "0 for a normal set"},
@@ -454,3 +561,72 @@ fn template_schema(preview: bool) -> Value {
         &["collectionId", "workout"],
     )
 }
+
+fn catalog_id(description: &str) -> Value {
+    json!({"type": "integer", "minimum": 1, "maximum": MAX_SAFE_INT, "description": description})
+}
+
+fn save_schema(approval: bool) -> Value {
+    let mut properties = json!({"preview_id": {"type": "string", "pattern": "^[a-f0-9]{24}$"}});
+    if approval {
+        properties["approved"] = json!({"type": "boolean", "const": true, "description": "The user has explicitly approved this exact preview."});
+        object(properties, &["preview_id", "approved"])
+    } else {
+        object(properties, &["preview_id"])
+    }
+}
+
+fn program_schema() -> Value {
+    let mut collection = collection_schema()["properties"]["collection"].clone();
+    collection["properties"]["title"]["pattern"] = json!("\\S");
+    let mut day = template_schema(true)["properties"]["workout"].clone();
+    day["required"] = json!(["title", "exercises"]);
+    day["properties"]["exercises"]
+        .as_object_mut()
+        .unwrap()
+        .remove("minItems");
+    day["properties"]["title"]["pattern"] = json!("\\S");
+    let sets = &mut day["properties"]["exercises"]["items"]["properties"]["sets"];
+    let set = &mut sets["items"]["properties"];
+    for key in ["reps", "from_reps", "to_reps"] {
+        set[key] = json!({"anyOf": [{"type": "integer", "minimum": 0}, {"type": "string"}]});
+    }
+    set["weight"] = json!({"anyOf": [
+        {"type": "number", "minimum": 0}, {"type":"null"},
+        {"type": "string", "pattern": "^\\s*(?:[0-9]+(?:\\.[0-9]+)?)?\\s*$"}
+    ]});
+    let basis = json!({"enum": ["per_hand", "total", "unknown"]});
+    set["load_basis"] = basis.clone();
+    let load = json!({"type":"number", "exclusiveMinimum":0});
+    set["estimate"] = object(
+        json!({
+            "unit": {"enum": ["kg", "lb"]},
+            "load_basis": basis,
+            "weight": load,
+            "lower": load,
+            "upper": load,
+            "selected_weight": load,
+            "reason": {"type":"string", "pattern":"\\S", "description":"Explain how the source movements, equipment, reps, and RIR inform this initial estimate."},
+            "source_refs": {"type":"array", "minItems":1, "maxItems":10, "uniqueItems":true, "items":{"type":"string", "minLength":1}}
+        }),
+        &["unit", "load_basis", "reason", "source_refs"],
+    );
+    set["estimate"]["oneOf"] = json!([
+        {"required":["weight"], "not":{"anyOf":[{"required":["lower"]}, {"required":["upper"]}, {"required":["selected_weight"]}]}},
+        {"required":["lower","upper"], "not":{"required":["weight"]}}
+    ]);
+    object(
+        json!({
+            "collection": collection,
+            "days": {"type":"array", "minItems":1, "items":day, "description":"Routine days in order. Use one set object per planned set."},
+            "weight_unit": {"enum":["kg","lb"], "description":"Unit used by Lyfta on the destination account. Required for weight estimates and automatic history."},
+            "use_history": {"type":"boolean", "default":false, "description":"Fill blank loads from the latest completed sets of the same catalog exercise."},
+            "history_from": {"type":"string", "format":"date", "description":"Optional inclusive UTC start date for history and estimate sources."}
+        }),
+        &["collection", "days"],
+    )
+}
+
+#[cfg(test)]
+#[path = "program_tests.rs"]
+mod program_tests;

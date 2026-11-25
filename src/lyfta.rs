@@ -22,6 +22,35 @@ pub enum Request {
     Create(Map<String, Value>),
 }
 
+pub struct ApiError {
+    pub message: String,
+    pub rejected: bool,
+}
+
+impl From<String> for ApiError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            rejected: false,
+        }
+    }
+}
+
+impl From<&str> for ApiError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+impl ApiError {
+    fn rejection(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            rejected: true,
+        }
+    }
+}
+
 impl LyftaClient {
     pub fn new(key: Option<String>) -> Result<Self, reqwest::Error> {
         let http = Client::builder()
@@ -45,6 +74,30 @@ impl LyftaClient {
         request: Request,
         cancellation: CancellationToken,
     ) -> Result<Value, String> {
+        self.exchange(path, request, cancellation)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    #[cfg(test)]
+    pub fn simulated(origin: Url) -> Self {
+        Self {
+            http: Client::builder()
+                .no_proxy()
+                .retry(retry::never())
+                .build()
+                .unwrap(),
+            origin,
+            key: Some("mock".into()),
+        }
+    }
+
+    pub async fn exchange(
+        &self,
+        path: &str,
+        request: Request,
+        cancellation: CancellationToken,
+    ) -> Result<Value, ApiError> {
         let creating = matches!(&request, Request::Create(_));
         let sample = matches!(&request, Request::Sample);
         let detail = if creating { VERIFY_WRITE } else { "" };
@@ -66,26 +119,48 @@ impl LyftaClient {
             request = request.bearer_auth(key);
         }
 
+        if cancellation.is_cancelled() {
+            return Err(ApiError::rejection(
+                "The Lyfta request was cancelled before sending.",
+            ));
+        }
+
         let exchange = async {
             let response = request.send().await.map_err(|err| {
-                if err.is_timeout() {
-                    error("The Lyfta request timed out.")
+                if err.is_connect() {
+                    ApiError::rejection("Could not connect to the Lyfta API.")
+                } else if err.is_timeout() {
+                    error("The Lyfta request timed out.").into()
                 } else {
-                    error("Could not complete the request to the Lyfta API.")
+                    error("Could not complete the request to the Lyfta API.").into()
                 }
             })?;
             match response.status() {
                 status @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
-                    return Err(format!(
+                    return Err(ApiError::rejection(format!(
                         "Lyfta denied access (HTTP {}). Check that LYFTA_API_KEY is valid.",
                         status.as_u16()
-                    ));
+                    )));
                 }
                 StatusCode::TOO_MANY_REQUESTS => {
-                    return Err("Lyfta’s request limit was reached. Wait before retrying.".into());
+                    return Err(ApiError::rejection(
+                        "Lyfta’s request limit was reached. Wait before retrying.",
+                    ));
                 }
                 status if !status.is_success() => {
-                    return Err(error(&format!("Lyfta returned HTTP {}.", status.as_u16())));
+                    if creating
+                        && matches!(
+                            status,
+                            StatusCode::BAD_REQUEST
+                                | StatusCode::NOT_FOUND
+                                | StatusCode::UNPROCESSABLE_ENTITY
+                        )
+                        && let Ok(data) = response.json::<Value>().await
+                        && let Some(rejection) = write_rejection(&data)
+                    {
+                        return Err(rejection);
+                    }
+                    return Err(error(&format!("Lyfta returned HTTP {}.", status.as_u16())).into());
                 }
                 _ => {}
             }
@@ -97,22 +172,34 @@ impl LyftaClient {
                 }
             })?;
             if !data.is_object() {
-                return Err(error("Lyfta returned an unexpected response."));
+                return Err(error("Lyfta returned an unexpected response.").into());
             }
             if data["status"] == false {
-                return Err(error("Lyfta reported that the request failed."));
+                if creating && let Some(rejection) = write_rejection(&data) {
+                    return Err(rejection);
+                }
+                return Err(error("Lyfta reported that the request failed.").into());
             }
             if creating && (data["status"] != true || !has_created_id(&data["data"]["id"])) {
-                return Err(error("Lyfta did not confirm the new item’s ID."));
+                return Err(error("Lyfta did not confirm the new item’s ID.").into());
             }
             Ok(data)
         };
 
         tokio::select! {
             biased;
-            _ = cancellation.cancelled() => Err(error("The Lyfta request was cancelled.")),
+            _ = cancellation.cancelled() => Err(error("The Lyfta request was cancelled.").into()),
             outcome = exchange => outcome,
         }
+    }
+
+    pub async fn account_id(&self, cancellation: &CancellationToken) -> Result<u64, String> {
+        let response = self
+            .request("/api/v1/me", Request::Read(vec![]), cancellation.clone())
+            .await?;
+        numeric_id(&response["id"])
+            .filter(|id| *id > 0)
+            .ok_or("Lyfta returned no account ID.".into())
     }
 
     pub async fn performed_exercises(
@@ -147,6 +234,21 @@ impl LyftaClient {
         }
         unreachable!()
     }
+}
+
+fn write_rejection(data: &Value) -> Option<ApiError> {
+    let message = data["message"].as_str()?;
+    (data["status"] == false
+        && matches!(
+            message,
+            "Title is required"
+                | "workout is required"
+                | "collectionId is required"
+                | "Collection not found"
+                | "Invalid API key"
+                | "Not allowed to view this user"
+        ))
+    .then(|| ApiError::rejection(format!("Lyfta rejected the write: {message}.")))
 }
 
 fn has_created_id(id: &Value) -> bool {
